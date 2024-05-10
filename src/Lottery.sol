@@ -87,8 +87,8 @@ contract Lottery is VRFV2WrapperConsumerBase, ConfirmedOwner {
         lotteries[roundID] = LotteryRound({
             participants: new address[](0),
             winner: address(0),
-            endTime: block.timestamp + 24 hours,
-            prizeAmount: 0,
+            endTime: block.timestamp + 1 minutes,
+            prizeAmount: 0.01 ether,
             prizeClaimed: false,
             paid: VRF_V2_WRAPPER.calculateRequestPrice(callbackGasLimit),
             randomValue: 0,
