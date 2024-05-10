@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-import "@chainlink/contracts/src/v0.8/vrf/VRFConsumerBaseV2.sol";
-import "@chainlink/contracts/src/v0.8/vrf/interfaces/VRFCoordinatorV2Interface.sol";
 import "@chainlink/contracts/src/v0.8/shared/access/ConfirmedOwner.sol";
+import "@chainlink/contracts/src/v0.8/vrf/VRFV2WrapperConsumerBase.sol";
+import "@chainlink/contracts/src/v0.8/shared/interfaces/LinkTokenInterface.sol";
 
-contract Lottery is VRFConsumerBaseV2, ConfirmedOwner {
+contract Lottery is VRFV2WrapperConsumerBase, ConfirmedOwner {
+    event RequestSent(uint256 requestId, uint32 numWords);
+    event RequestFulfilled(
+        uint256 requestId,
+        uint256[] randomWords,
+        uint256 payment
+    );
+
     event TicketPurchased(address indexed buyer, uint256 indexed ticketId);
     event WinnerDrawn(
         uint256 indexed requestId,
@@ -14,12 +21,22 @@ contract Lottery is VRFConsumerBaseV2, ConfirmedOwner {
     );
     event PrizeClaimed(uint256 indexed requestId, address indexed claimant);
 
-    VRFCoordinatorV2Interface private vrfCoordinator;
-    bytes32 private keyHash;
+    error PaymentInsufficient();
+    error InvalidRoundID();
+    error LotteryEnded();
+    error RandomValueNotReceived();
+    error LotteryNotEnded();
+    error NotWinner();
+
     uint32 private callbackGasLimit = 100000;
     uint16 private requestConfirmations = 3;
     uint32 private numWords = 1;
-    uint64 private subscriptionId;
+
+    // Address LINK - hardcoded for Sepolia
+    address linkAddress = 0x779877A7B0D9E8603169DdbD7836e478b4624789;
+
+    // address WRAPPER - hardcoded for Sepolia
+    address wrapperAddress = 0xab18414CD93297B0d12ac29E63Ca20f515b3DB46;
 
     struct LotteryRound {
         address[] participants;
@@ -27,58 +44,60 @@ contract Lottery is VRFConsumerBaseV2, ConfirmedOwner {
         uint256 endTime;
         uint256 prizeAmount;
         bool prizeClaimed;
+        uint256 paid; // amount paid in link
+        bool fulfilled; // whether the request has been successfully fulfilled by the VRF
+        uint256 randomValue; // the random value returned by the VRF
     }
 
-    // Mapping from request ID to LotteryRound
+    //Array of all lottery round IDs
+    uint256[] public lotteryRoundIds;
+    // Mapping from round ID to LotteryRound
     mapping(uint256 => LotteryRound) public lotteries;
-    // Global list of all registered participants (ever participated)
-    address[] public allParticipants;
-    // Mapping to check if address is already added to allParticipants
-    mapping(address => bool) private registeredParticipants;
 
     uint256 public ticketPrice = 0.01 ether;
     uint256 private lastRequestId;
 
-    constructor(
-        uint64 _subscriptionId
-    )
-        VRFConsumerBaseV2(0x8103B0A8A00be2DDC778e6e7eaa21791Cd364625)
+    constructor()
+        VRFV2WrapperConsumerBase(linkAddress, wrapperAddress)
         ConfirmedOwner(msg.sender)
-    {
-        vrfCoordinator = VRFCoordinatorV2Interface(
-            0x8103B0A8A00be2DDC778e6e7eaa21791Cd364625
-        );
-        subscriptionId = _subscriptionId;
-        keyHash = 0x474e34a077df58807dbe9c96d3c009b23b3c6d0cce433e59bbf5b34f823bc56c;
-    }
+    {}
 
-    function buyTicket() public payable {
-        require(msg.value == ticketPrice, "Incorrect payment");
-        LotteryRound storage round = lotteries[lastRequestId];
-        round.participants.push(msg.sender);
-        // Add to global participants list if not already registered
-        if (!registeredParticipants[msg.sender]) {
-            registeredParticipants[msg.sender] = true;
-            allParticipants.push(msg.sender);
+    function buyTicket(uint256 _roundID) public payable {
+        if (lotteries[_roundID].endTime == 0) {
+            revert InvalidRoundID();
         }
+        if (msg.value != ticketPrice) {
+            revert PaymentInsufficient();
+        }
+        if (lotteries[_roundID].endTime < block.timestamp) {
+            revert LotteryEnded();
+        }
+        LotteryRound storage round = lotteries[_roundID];
+        round.participants.push(msg.sender);
+
         emit TicketPurchased(msg.sender, round.participants.length);
     }
 
-    function startLottery() external onlyOwner {
-        lastRequestId = vrfCoordinator.requestRandomWords(
-            keyHash,
-            subscriptionId,
-            requestConfirmations,
+    function createLottery() external onlyOwner returns (uint256 roundID) {
+        roundID = requestRandomness(
             callbackGasLimit,
+            requestConfirmations,
             numWords
         );
-        lotteries[lastRequestId] = LotteryRound({
+        lotteries[roundID] = LotteryRound({
             participants: new address[](0),
             winner: address(0),
             endTime: block.timestamp + 24 hours,
             prizeAmount: 0,
-            prizeClaimed: false
+            prizeClaimed: false,
+            paid: VRF_V2_WRAPPER.calculateRequestPrice(callbackGasLimit),
+            randomValue: 0,
+            fulfilled: false
         });
+
+        lotteryRoundIds.push(roundID);
+        emit RequestSent(roundID, numWords);
+        return roundID;
     }
 
     function fulfillRandomWords(
@@ -86,23 +105,54 @@ contract Lottery is VRFConsumerBaseV2, ConfirmedOwner {
         uint256[] memory _randomWords
     ) internal override {
         LotteryRound storage round = lotteries[_requestId];
-        require(block.timestamp >= round.endTime, "Lottery not ended yet");
-        require(round.winner == address(0), "Winner already drawn");
 
-        uint256 winnerIndex = _randomWords[0] % round.participants.length;
-        round.winner = round.participants[winnerIndex];
-        round.prizeAmount = address(this).balance;
+        //ensure the roundID is valid
+        if (round.endTime == 0) {
+            revert InvalidRoundID();
+        }
+
+        round.fulfilled = true;
+        round.randomValue = _randomWords[0];
+
+        emit RequestFulfilled(_requestId, _randomWords, round.paid);
         emit WinnerDrawn(_requestId, round.winner, round.prizeAmount);
     }
 
-    function claimPrize(uint256 _requestId) external {
-        LotteryRound storage round = lotteries[_requestId];
-        require(msg.sender == round.winner, "Not the winner");
-        require(!round.prizeClaimed, "Prize already claimed");
+    function chooseWinner(uint256 _roundID) external onlyOwner {
+        LotteryRound storage round = lotteries[_roundID];
+        if (round.endTime == 0) {
+            revert InvalidRoundID();
+        }
+        if (!round.fulfilled) {
+            revert RandomValueNotReceived();
+        }
+        if (round.endTime > block.timestamp) {
+            revert LotteryNotEnded();
+        }
+
+        uint256 winnerIndex = round.randomValue % round.participants.length;
+        round.winner = round.participants[winnerIndex];
+
+        round.prizeAmount = address(this).balance;
+        round.prizeClaimed = true;
+        emit PrizeClaimed(_roundID, round.winner);
+    }
+
+    function claimPrize(uint256 _roundID) external {
+        LotteryRound storage round = lotteries[_roundID];
+        if (round.endTime == 0) {
+            revert InvalidRoundID();
+        }
+        if (round.endTime < block.timestamp) {
+            revert LotteryEnded();
+        }
+        if (round.winner != msg.sender) {
+            revert NotWinner();
+        }
 
         payable(msg.sender).transfer(round.prizeAmount);
         round.prizeClaimed = true;
-        emit PrizeClaimed(_requestId, msg.sender);
+        emit PrizeClaimed(_roundID, msg.sender);
     }
 
     function getLotteryInfo(
@@ -111,7 +161,7 @@ contract Lottery is VRFConsumerBaseV2, ConfirmedOwner {
         return lotteries[_requestId];
     }
 
-    function getAllParticipants() external view returns (address[] memory) {
-        return allParticipants;
+    function getAllLotteryRoundIds() external view returns (uint256[] memory) {
+        return lotteryRoundIds;
     }
 }
